@@ -322,6 +322,176 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
 
 #################################################################################
+#                      SVDQuant (SVD-based Quantization)                        #
+#################################################################################
+
+class SVDLinear(nn.Module):
+    """
+    A linear layer decomposed into U, S, Vh for SVD-based compression.
+    This layer can be fine-tuned.
+    """
+    def __init__(self, in_features, out_features, bias=True, rank_ratio=0.5):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank_ratio = rank_ratio
+        rank = int(min(in_features, out_features) * rank_ratio)
+        self.rank = rank
+
+        # Decomposed matrices (修正shape)
+        self.U = nn.Parameter(torch.empty(in_features, rank))
+        self.S = nn.Parameter(torch.empty(rank))
+        self.Vh = nn.Parameter(torch.empty(rank, out_features))
+        
+        # Initialize parameters
+        nn.init.kaiming_uniform_(self.U, a=math.sqrt(5))
+        nn.init.zeros_(self.S) # Initialize singular values to zero
+        nn.init.kaiming_uniform_(self.Vh, a=math.sqrt(5))
+
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+            nn.init.zeros_(self.bias)
+        else:
+            self.register_parameter('bias', None)
+
+        # 注册所有量化相关buffer，保证推理和量化模型结构一致
+        self.register_buffer('q_U', torch.zeros(in_features, rank, dtype=torch.int8))
+        self.register_buffer('scale_U', torch.tensor(1.0))
+        self.register_buffer('q_S', torch.zeros(rank, dtype=torch.int8))
+        self.register_buffer('scale_S', torch.tensor(1.0))
+        self.register_buffer('q_Vh', torch.zeros(rank, out_features, dtype=torch.int8))
+        self.register_buffer('scale_Vh', torch.tensor(1.0))
+        if bias:
+            self.register_buffer('q_bias', torch.zeros(out_features, dtype=torch.int8))
+            self.register_buffer('scale_bias', torch.tensor(1.0))
+        else:
+            self.register_buffer('q_bias', torch.zeros(1, dtype=torch.int8))
+            self.register_buffer('scale_bias', torch.tensor(1.0))
+
+        self.is_quantized = False
+
+    def from_linear(self, linear_layer):
+        """
+        Initializes SVD components from a standard nn.Linear layer.
+        """
+        with torch.no_grad():
+            W = linear_layer.weight.data
+            # 对 W.T 做 SVD，保证和 nn.Linear forward 一致
+            U, S, Vh = torch.linalg.svd(W.T, full_matrices=False)
+            self.U.data.copy_(U[:, :self.rank])    # [in_features, rank]
+            self.S.data.copy_(S[:self.rank])       # [rank]
+            self.Vh.data.copy_(Vh[:self.rank, :])  # [rank, out_features]
+            if linear_layer.bias is not None and self.bias is not None:
+                self.bias.data.copy_(linear_layer.bias.data)
+        return self
+
+    def quantize_parameters(self, num_bits=8):
+        """
+        对U, S, Vh, bias进行对称int8量化，存储量化参数。
+        """
+        def quantize_tensor(tensor, num_bits=8):
+            qmin = -2**(num_bits-1)
+            qmax = 2**(num_bits-1) - 1
+            scale = tensor.abs().max() / qmax if tensor.abs().max() > 0 else 1.0
+            q_tensor = (tensor / scale).round().clamp(qmin, qmax).to(torch.int8)
+            return q_tensor, scale
+
+        q_U, scale_U = quantize_tensor(self.U.data, num_bits)
+        q_S, scale_S = quantize_tensor(self.S.data, num_bits)
+        q_Vh, scale_Vh = quantize_tensor(self.Vh.data, num_bits)
+        if self.bias is not None:
+            q_bias, scale_bias = quantize_tensor(self.bias.data, num_bits)
+        else:
+            q_bias, scale_bias = None, None
+        # 注册为buffer，保证state_dict保存
+        self.register_buffer('q_U', q_U)
+        self.register_buffer('scale_U', torch.tensor(scale_U))
+        self.register_buffer('q_S', q_S)
+        self.register_buffer('scale_S', torch.tensor(scale_S))
+        self.register_buffer('q_Vh', q_Vh)
+        self.register_buffer('scale_Vh', torch.tensor(scale_Vh))
+        if q_bias is not None:
+            self.register_buffer('q_bias', q_bias)
+            self.register_buffer('scale_bias', torch.tensor(scale_bias))
+        else:
+            self.register_buffer('q_bias', torch.zeros(1, dtype=torch.int8))
+            self.register_buffer('scale_bias', torch.tensor(1.0))
+        self.is_quantized = True
+
+    def dequantize_tensor(self, q_tensor, scale):
+        return q_tensor.float() * scale
+
+    def forward(self, x):
+        # 调试：打印is_quantized
+        if not hasattr(self, 'is_quantized'):
+            self.is_quantized = False
+        print('SVDLinear forward, is_quantized:', self.is_quantized)
+        if self.is_quantized:
+            U = self.dequantize_tensor(self.q_U, self.scale_U)
+            S = self.dequantize_tensor(self.q_S, self.scale_S)
+            Vh = self.dequantize_tensor(self.q_Vh, self.scale_Vh)
+        else:
+            U, S, Vh = self.U, self.S, self.Vh
+        # 正确的SVD重组顺序
+        res = x @ U      # [batch, rank]
+        res = res * S    # [batch, rank]
+        res = res @ Vh   # [batch, out_features]
+        bias = self.bias if not self.is_quantized else (self.dequantize_tensor(self.q_bias, self.scale_bias) if self.bias is not None else None)
+        if bias is not None:
+            res = res + bias
+        return res
+        
+    def __repr__(self):
+        return (f"SVDLinear(in_features={self.in_features}, out_features={self.out_features}, "
+                f"bias={self.bias is not None}, rank={self.rank})")
+
+
+def apply_svd_to_dit(model, rank_ratio=0.5):
+    """
+    Recursively replaces nn.Linear in Attention and MLP blocks of a DiT model
+    with SVDLinear layers. This function should be called after loading a pre-trained model.
+    """
+    for block in model.blocks:
+        # Replace in Attention block
+        attn = block.attn
+        if isinstance(attn.qkv, nn.Linear):
+            qkv = attn.qkv
+            svd_qkv = SVDLinear(qkv.in_features, qkv.out_features, qkv.bias is not None, rank_ratio).from_linear(qkv)
+            attn.qkv = svd_qkv.to(qkv.weight.device)
+        
+        if isinstance(attn.proj, nn.Linear):
+            proj = attn.proj
+            svd_proj = SVDLinear(proj.in_features, proj.out_features, proj.bias is not None, rank_ratio).from_linear(proj)
+            attn.proj = svd_proj.to(proj.weight.device)
+
+        # Replace in MLP block
+        mlp = block.mlp
+        if isinstance(mlp.fc1, nn.Linear):
+            fc1 = mlp.fc1
+            svd_fc1 = SVDLinear(fc1.in_features, fc1.out_features, fc1.bias is not None, rank_ratio).from_linear(fc1)
+            mlp.fc1 = svd_fc1.to(fc1.weight.device)
+
+        if isinstance(mlp.fc2, nn.Linear):
+            fc2 = mlp.fc2
+            svd_fc2 = SVDLinear(fc2.in_features, fc2.out_features, fc2.bias is not None, rank_ratio).from_linear(fc2)
+            mlp.fc2 = svd_fc2.to(fc2.weight.device)
+
+    # Replace in FinalLayer
+    if isinstance(model.final_layer.linear, nn.Linear):
+        final_linear = model.final_layer.linear
+        svd_final = SVDLinear(
+            final_linear.in_features, 
+            final_linear.out_features, 
+            final_linear.bias is not None, 
+            rank_ratio
+        ).from_linear(final_linear)
+        model.final_layer.linear = svd_final.to(final_linear.weight.device)
+    
+    print(f"Replaced nn.Linear layers in Transformer blocks with SVDLinear (rank_ratio={rank_ratio}).")
+    return model
+
+
+#################################################################################
 #                                   DiT Configs                                  #
 #################################################################################
 

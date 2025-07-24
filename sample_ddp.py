@@ -23,6 +23,7 @@ from PIL import Image
 import numpy as np
 import math
 import argparse
+import time
 
 
 def create_npz_from_sample_folder(sample_dir, num=50_000):
@@ -70,10 +71,20 @@ def main(args):
         input_size=latent_size,
         num_classes=args.num_classes
     ).to(device)
+    
+    # 替换为SVDLinear结构（兼容量化模型）
+    from models import apply_svd_to_dit
+    model = apply_svd_to_dit(model, rank_ratio=args.rank_ratio)
+    
     # Auto-download a pre-trained model or load a custom DiT checkpoint from train.py:
     ckpt_path = args.ckpt or f"DiT-XL-2-{args.image_size}x{args.image_size}.pt"
     state_dict = find_model(ckpt_path)
     model.load_state_dict(state_dict)
+    # 加载后设置所有SVDLinear的is_quantized为True
+    for m in model.modules():
+        if m.__class__.__name__ == 'SVDLinear':
+            m.is_quantized = True
+            print('SVDLinear layer:', m, 'is_quantized:', getattr(m, 'is_quantized', False))
     model.eval()  # important!
     diffusion = create_diffusion(str(args.num_sampling_steps))
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
@@ -90,6 +101,10 @@ def main(args):
         os.makedirs(sample_folder_dir, exist_ok=True)
         print(f"Saving .png samples at {sample_folder_dir}")
     dist.barrier()
+
+    # === 统计推理开始时间 ===
+    if rank == 0:
+        start = time.time()
 
     # Figure out how many samples we need to generate on each GPU and how many iterations we need to run:
     n = args.per_proc_batch_size
@@ -143,16 +158,20 @@ def main(args):
         create_npz_from_sample_folder(sample_folder_dir, args.num_fid_samples)
         print("Done.")
     dist.barrier()
+    # === 统计推理结束时间并输出 ===
+    if rank == 0:
+        end = time.time()
+        print(f"[INFO] 推理总耗时: {end - start:.2f} 秒")
     dist.destroy_process_group()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
-    parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="ema")
-    parser.add_argument("--sample-dir", type=str, default="samples")
+    parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="mse")
+    parser.add_argument("--sample-dir", type=str, default="/root/autodl-tmp/imagenet-1k/generated")
     parser.add_argument("--per-proc-batch-size", type=int, default=32)
-    parser.add_argument("--num-fid-samples", type=int, default=50_000)
+    parser.add_argument("--num-fid-samples", type=int, default=5000)
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--cfg-scale",  type=float, default=1.5)
@@ -160,7 +179,8 @@ if __name__ == "__main__":
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True,
                         help="By default, use TF32 matmuls. This massively accelerates sampling on Ampere GPUs.")
-    parser.add_argument("--ckpt", type=str, default=None,
+    parser.add_argument("--ckpt", type=str, default="DiT-XL-2-256x256.pt",
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
+    parser.add_argument("--rank-ratio", type=float, default=0.95, help="SVD rank ratio for quantized model (default: 0.5)")
     args = parser.parse_args()
     main(args)

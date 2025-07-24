@@ -16,6 +16,7 @@ from diffusers.models import AutoencoderKL
 from download import find_model
 from models import DiT_models
 import argparse
+import os
 
 
 def main(args):
@@ -41,7 +42,16 @@ def main(args):
     model.load_state_dict(state_dict)
     model.eval()  # important!
     diffusion = create_diffusion(str(args.num_sampling_steps))
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    # 优先加载本地VAE权重（如./vae-mse），如不存在则尝试远程下载
+    vae_local_path = f"vae-{args.vae}"
+    if os.path.exists(vae_local_path):
+        print(f"[INFO] 使用本地VAE权重: {vae_local_path}")
+        vae = AutoencoderKL.from_pretrained(vae_local_path).to(device)
+    else:
+        print(f"[WARN] 本地VAE权重 {vae_local_path} 不存在，尝试从HuggingFace远程下载（需科学上网）")
+        vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    # 如需本地加载，请手动下载 https://huggingface.co/stabilityai/sd-vae-ft-mse 或 https://huggingface.co/stabilityai/sd-vae-ft-ema
+    # 并将所有文件放入 ./vae-mse 或 ./vae-ema 目录下
 
     # Labels to condition the model with (feel free to change):
     class_labels = [207, 360, 387, 974, 88, 979, 417, 279]

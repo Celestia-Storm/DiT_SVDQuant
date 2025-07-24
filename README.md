@@ -1,163 +1,118 @@
-## Scalable Diffusion Models with Transformers (DiT)<br><sub>Official PyTorch Implementation</sub>
+# DiT + SVDQuant: 量化与评测
 
-### [Paper](http://arxiv.org/abs/2212.09748) | [Project Page](https://www.wpeebles.com/DiT) | Run DiT-XL/2 [![Hugging Face Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue)](https://huggingface.co/spaces/wpeebles/DiT) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](http://colab.research.google.com/github/facebookresearch/DiT/blob/main/run_DiT.ipynb) <a href="https://replicate.com/arielreplicate/scalable_diffusion_with_transformers"><img src="https://replicate.com/arielreplicate/scalable_diffusion_with_transformers/badge"></a>
+本项目基于 DiT (Diffusion Transformer) 模型，集成了 SVDQuant（基于SVD的量化）方法，并支持对生成图片的 FID/KID/sFID 等指标评测。
 
-![DiT samples](visuals/sample_grid_0.png)
+## 1. 拉取原有 DiT 代码
 
-This repo contains PyTorch model definitions, pre-trained weights and training/sampling code for our paper exploring 
-diffusion models with transformers (DiTs). You can find more visualizations on our [project page](https://www.wpeebles.com/DiT).
-
-> [**Scalable Diffusion Models with Transformers**](https://www.wpeebles.com/DiT)<br>
-> [William Peebles](https://www.wpeebles.com), [Saining Xie](https://www.sainingxie.com)
-> <br>UC Berkeley, New York University<br>
-
-We train latent diffusion models, replacing the commonly-used U-Net backbone with a transformer that operates on 
-latent patches. We analyze the scalability of our Diffusion Transformers (DiTs) through the lens of forward pass 
-complexity as measured by Gflops. We find that DiTs with higher Gflops---through increased transformer depth/width or
-increased number of input tokens---consistently have lower FID. In addition to good scalability properties, our 
-DiT-XL/2 models outperform all prior diffusion models on the class-conditional ImageNet 512×512 and 256×256 benchmarks, 
-achieving a state-of-the-art FID of 2.27 on the latter.
-
-This repository contains:
-
-* 🪐 A simple PyTorch [implementation](models.py) of DiT
-* ⚡️ Pre-trained class-conditional DiT models trained on ImageNet (512x512 and 256x256)
-* 💥 A self-contained [Hugging Face Space](https://huggingface.co/spaces/wpeebles/DiT) and [Colab notebook](http://colab.research.google.com/github/facebookresearch/DiT/blob/main/run_DiT.ipynb) for running pre-trained DiT-XL/2 models
-* 🛸 A DiT [training script](train.py) using PyTorch DDP
-
-An implementation of DiT directly in Hugging Face `diffusers` can also be found [here](https://github.com/huggingface/diffusers/blob/main/docs/source/en/api/pipelines/dit.mdx).
-
-
-## Setup
-
-First, download and set up the repo:
+本项目以 [facebookresearch/DiT](https://github.com/facebookresearch/DiT) 为基础。你可以直接拉取本仓库，或先拉取原始DiT代码后，合并本项目的SVDQuant相关文件。
 
 ```bash
 git clone https://github.com/facebookresearch/DiT.git
+# 或直接拉取本项目
+# git clone <your-repo-url>
 cd DiT
 ```
 
-We provide an [`environment.yml`](environment.yml) file that can be used to create a Conda environment. If you only want 
-to run pre-trained models locally on CPU, you can remove the `cudatoolkit` and `pytorch-cuda` requirements from the file.
+## 2. 创建虚拟环境
+
+推荐使用 Conda 环境。项目已提供 `environment.yml` 文件：
 
 ```bash
 conda env create -f environment.yml
 conda activate DiT
 ```
 
+如仅需CPU推理，可移除 `cudatoolkit` 和 `pytorch-cuda` 相关依赖。
 
-## Sampling [![Hugging Face Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue)](https://huggingface.co/spaces/wpeebles/DiT) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](http://colab.research.google.com/github/facebookresearch/DiT/blob/main/run_DiT.ipynb)
-![More DiT samples](visuals/sample_grid_1.png)
+## 3. 下载预训练模型权重 & 简单采样
 
-**Pre-trained DiT checkpoints.** You can sample from our pre-trained DiT models with [`sample.py`](sample.py). Weights for our pre-trained DiT model will be 
-automatically downloaded depending on the model you use. The script has various arguments to switch between the 256x256
-and 512x512 models, adjust sampling steps, change the classifier-free guidance scale, etc. For example, to sample from
-our 512x512 DiT-XL/2 model, you can use:
+首次采样时会自动下载预训练权重。以 256x256 DiT-XL/2 为例：
 
 ```bash
-python sample.py --image-size 512 --seed 1
+python sample.py --image-size 256 --seed 1
 ```
 
-For convenience, our pre-trained DiT models can be downloaded directly here as well:
-
-| DiT Model     | Image Resolution | FID-50K | Inception Score | Gflops | 
-|---------------|------------------|---------|-----------------|--------|
-| [XL/2](https://dl.fbaipublicfiles.com/DiT/models/DiT-XL-2-256x256.pt) | 256x256          | 2.27    | 278.24          | 119    |
-| [XL/2](https://dl.fbaipublicfiles.com/DiT/models/DiT-XL-2-512x512.pt) | 512x512          | 3.04    | 240.82          | 525    |
-
-
-**Custom DiT checkpoints.** If you've trained a new DiT model with [`train.py`](train.py) (see [below](#training-dit)), you can add the `--ckpt`
-argument to use your own checkpoint instead. For example, to sample from the EMA weights of a custom 
-256x256 DiT-L/4 model, run:
+如需指定权重路径：
 
 ```bash
-python sample.py --model DiT-L/4 --image-size 256 --ckpt /path/to/model.pt
+python sample.py --model DiT-XL/2 --image-size 256 --ckpt pretrained_models/DiT-XL-2-256x256.pt
 ```
 
+## 4. SVDQuant分解与量化（`models.py` 相关说明）
 
-## Training DiT
+- `models.py` 文件中新增了 `SVDLinear` 类，实现了基于SVD的线性层分解与量化。
+- 提供 `apply_svd_to_dit(model, rank_ratio)` 方法，可将DiT模型中的所有 `nn.Linear` 替换为 `SVDLinear`，并支持指定SVD分解的秩比例。
+- `SVDLinear` 支持参数量化（int8），并在推理时自动解量化。
 
-We provide a training script for DiT in [`train.py`](train.py). This script can be used to train class-conditional 
-DiT models, but it can be easily modified to support other types of conditioning. To launch DiT-XL/2 (256x256) training with `N` GPUs on 
-one node:
+## 5. 量化程序：`quantize_ptq.py` 使用说明
+
+该脚本用于对DiT模型进行SVD分解和PTQ（后训练量化），并保存量化后权重。
+
+**示例用法：**
 
 ```bash
-torchrun --nnodes=1 --nproc_per_node=N train.py --model DiT-XL/2 --data-path /path/to/imagenet/train
+python quantize_ptq.py \
+  --ckpt pretrained_models/DiT-XL-2-256x256.pt \
+  --model DiT-XL/2 \
+  --num-classes 1000 \
+  --rank-ratio 0.95 \
+  --num-bits 8 \
+  --output quantized_model.pt
 ```
 
-### PyTorch Training Results
+- `--ckpt`：原始模型权重路径
+- `--model`：模型类型（如 DiT-XL/2）
+- `--rank-ratio`：SVD分解秩比例（如0.95）
+- `--num-bits`：量化比特宽度（如8）
+- `--output`：保存量化后权重的路径
 
-We've trained DiT-XL/2 and DiT-B/4 models from scratch with the PyTorch training script
-to verify that it reproduces the original JAX results up to several hundred thousand training iterations. Across our experiments, the PyTorch-trained models give 
-similar (and sometimes slightly better) results compared to the JAX-trained models up to reasonable random variation. Some data points:
+## 6. 批量推理生成图片：`sample_ddp.py` 使用说明
 
-| DiT Model  | Train Steps | FID-50K<br> (JAX Training) | FID-50K<br> (PyTorch Training) | PyTorch Global Training Seed |
-|------------|-------------|----------------------------|--------------------------------|------------------------------|
-| XL/2       | 400K        | 19.5                       | **18.1**                       | 42                           |
-| B/4        | 400K        | **68.4**                   | 68.9                           | 42                           |
-| B/4        | 400K        | 68.4                       | **68.3**                       | 100                          |
+该脚本支持多卡并行采样，生成大量图片并自动保存为 `.npz` 文件，便于后续评测。
 
-These models were trained at 256x256 resolution; we used 8x A100s to train XL/2 and 4x A100s to train B/4. Note that FID 
-here is computed with 250 DDPM sampling steps, with the `mse` VAE decoder and without guidance (`cfg-scale=1`). 
-
-**TF32 Note (important for A100 users).** When we ran the above tests, TF32 matmuls were disabled per PyTorch's defaults. 
-We've enabled them at the top of `train.py` and `sample.py` because it makes training and sampling way way way faster on 
-A100s (and should for other Ampere GPUs too), but note that the use of TF32 may lead to some differences compared to 
-the above results.
-
-### Enhancements
-Training (and sampling) could likely be sped-up significantly by:
-- [ ] using [Flash Attention](https://github.com/HazyResearch/flash-attention) in the DiT model
-- [ ] using `torch.compile` in PyTorch 2.0
-
-Basic features that would be nice to add:
-- [ ] Monitor FID and other metrics
-- [ ] Generate and save samples from the EMA model periodically
-- [ ] Resume training from a checkpoint
-- [ ] AMP/bfloat16 support
-
-**🔥 Feature Update** Check out this repository at https://github.com/chuanyangjin/fast-DiT to preview a selection of training speed acceleration and memory saving features including gradient checkpointing, mixed precision training and pre-extrated VAE features. With these advancements, we have achieved a training speed of 0.84 steps/sec for DiT-XL/2 using just a single A100 GPU.
-
-## Evaluation (FID, Inception Score, etc.)
-
-We include a [`sample_ddp.py`](sample_ddp.py) script which samples a large number of images from a DiT model in parallel. This script 
-generates a folder of samples as well as a `.npz` file which can be directly used with [ADM's TensorFlow
-evaluation suite](https://github.com/openai/guided-diffusion/tree/main/evaluations) to compute FID, Inception Score and
-other metrics. For example, to sample 50K images from our pre-trained DiT-XL/2 model over `N` GPUs, run:
+**示例用法（多卡DDP）：**
 
 ```bash
-torchrun --nnodes=1 --nproc_per_node=N sample_ddp.py --model DiT-XL/2 --num-fid-samples 50000
+torchrun --nnodes=1 --nproc_per_node=4 sample_ddp.py \
+  --model DiT-XL/2 \
+  --ckpt quantized_model.pt \
+  --num-fid-samples 5000 \
+  --image-size 256 \
+  --rank-ratio 0.95 \
+  --sample-dir ./generated
 ```
 
-There are several additional options; see [`sample_ddp.py`](sample_ddp.py) for details. 
+- `--ckpt` 可指定量化后模型权重
+- `--num-fid-samples` 生成图片数量
+- `--sample-dir` 图片保存目录
 
+## 7. 图片质量评估：`evaluate_metrics.py` 使用说明
 
-## Differences from JAX
+本脚本基于 [torch-fidelity](https://github.com/toshas/torch-fidelity) 评测 FID/KID/sFID 等指标。
 
-Our models were originally trained in JAX on TPUs. The weights in this repo are ported directly from the JAX models. 
-There may be minor differences in results stemming from sampling with different floating point precisions. We re-evaluated 
-our ported PyTorch weights at FP32, and they actually perform marginally better than sampling in JAX (2.21 FID 
-versus 2.27 in the paper).
+**示例用法：**
 
-
-## BibTeX
-
-```bibtex
-@article{Peebles2022DiT,
-  title={Scalable Diffusion Models with Transformers},
-  author={William Peebles and Saining Xie},
-  year={2022},
-  journal={arXiv preprint arXiv:2212.09748},
-}
+```bash
+python evaluate_metrics.py \
+  --real_dir /path/to/real/images \
+  --fake_dir /path/to/generated/images \
+  --num_images 5000
 ```
 
+- `--real_dir`：真实图片目录
+- `--fake_dir`：生成图片目录
+- `--num_images`：参与评测的图片数量
 
-## Acknowledgments
-We thank Kaiming He, Ronghang Hu, Alexander Berg, Shoubhik Debnath, Tim Brooks, Ilija Radosavovic and Tete Xiao for helpful discussions. 
-William Peebles is supported by the NSF Graduate Research Fellowship.
+脚本会自动输出 FID、KID、sFID 等评测结果。
 
-This codebase borrows from OpenAI's diffusion repos, most notably [ADM](https://github.com/openai/guided-diffusion).
+---
 
+## 参考/致谢
 
-## License
-The code and model weights are licensed under CC-BY-NC. See [`LICENSE.txt`](LICENSE.txt) for details.
+- 本项目基于 [facebookresearch/DiT](https://github.com/facebookresearch/DiT)。
+- SVDQuant 相关实现见 `models.py`。
+- 评测部分基于 [torch-fidelity](https://github.com/toshas/torch-fidelity)。
+
+---
+
+如需进一步定制或补充内容，请告知！
