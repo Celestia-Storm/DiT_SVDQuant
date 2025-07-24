@@ -105,14 +105,8 @@ python evaluate_metrics.py \
 
 脚本会自动输出 FID、KID、sFID 等评测结果。
 
----
-
 ## 参考/致谢
 
 - 本项目基于 [facebookresearch/DiT](https://github.com/facebookresearch/DiT)。
 - SVDQuant 相关实现见 `models.py`。
 - 评测部分基于 [torch-fidelity](https://github.com/toshas/torch-fidelity)。
-
----
-
-如需进一步定制或补充内容，请告知！
