@@ -42,9 +42,9 @@ def main(args):
     model = apply_svd_to_dit(model, rank_ratio=args.rank_ratio)
     print("SVD decomposition applied.")
 
-    # # 3. PTQ权重量化
-    # quantize_all_svdlinear(model, num_bits=args.num_bits)
-    # print(f"PTQ quantization (int{args.num_bits}) applied to all SVDLinear layers.")
+    # 3. PTQ权重量化
+    quantize_all_svdlinear(model, num_bits=args.num_bits)
+    print(f"PTQ quantization (int{args.num_bits}) applied to all SVDLinear layers.")
 
     # 4. 保存量化后模型（转回cpu保存）
     model = model.cpu()
@@ -57,7 +57,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt", type=str, default="pretrained_models/DiT-XL-2-256x256.pt", help="Path to the pre-trained DiT checkpoint. 默认: pretrained_models/DiT-XL-2-256x256.pt")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
     parser.add_argument("--num-classes", type=int, default=1000)
-    parser.add_argument("--rank-ratio", type=float, default=0.95, help="SVD rank ratio for quantization.")
+    parser.add_argument("--rank-ratio", type=float, default=0.8, help="SVD rank ratio for quantization.")
     parser.add_argument("--num-bits", type=int, default=8, help="Quantization bit width (default: 8)")
     parser.add_argument("--output", type=str, default="quantized_model.pt", help="Output path for quantized model.")
     args = parser.parse_args()

@@ -339,9 +339,9 @@ class SVDLinear(nn.Module):
         self.rank = rank
 
         # Decomposed matrices (修正shape)
-        self.U = nn.Parameter(torch.empty(in_features, rank))
+        self.U = nn.Parameter(torch.empty(out_features, rank))
         self.S = nn.Parameter(torch.empty(rank))
-        self.Vh = nn.Parameter(torch.empty(rank, out_features))
+        self.Vh = nn.Parameter(torch.empty(rank, in_features))
         
         # Initialize parameters
         nn.init.kaiming_uniform_(self.U, a=math.sqrt(5))
@@ -355,11 +355,11 @@ class SVDLinear(nn.Module):
             self.register_parameter('bias', None)
 
         # 注册所有量化相关buffer，保证推理和量化模型结构一致
-        self.register_buffer('q_U', torch.zeros(in_features, rank, dtype=torch.int8))
+        self.register_buffer('q_U', torch.zeros(out_features, rank, dtype=torch.int8))
         self.register_buffer('scale_U', torch.tensor(1.0))
         self.register_buffer('q_S', torch.zeros(rank, dtype=torch.int8))
         self.register_buffer('scale_S', torch.tensor(1.0))
-        self.register_buffer('q_Vh', torch.zeros(rank, out_features, dtype=torch.int8))
+        self.register_buffer('q_Vh', torch.zeros(rank, in_features, dtype=torch.int8))
         self.register_buffer('scale_Vh', torch.tensor(1.0))
         if bias:
             self.register_buffer('q_bias', torch.zeros(out_features, dtype=torch.int8))
@@ -375,14 +375,29 @@ class SVDLinear(nn.Module):
         Initializes SVD components from a standard nn.Linear layer.
         """
         with torch.no_grad():
-            W = linear_layer.weight.data
-            # 对 W.T 做 SVD，保证和 nn.Linear forward 一致
-            U, S, Vh = torch.linalg.svd(W.T, full_matrices=False)
-            self.U.data.copy_(U[:, :self.rank])    # [in_features, rank]
+            W = linear_layer.weight.data  # [out_features, in_features]
+            # 保存原始权重用于测试
+            self.register_buffer('original_weight', W.clone())
+            if linear_layer.bias is not None:
+                self.register_buffer('original_bias', linear_layer.bias.data.clone())
+            else:
+                self.register_buffer('original_bias', None)
+            
+            # 对 W 做 SVD，W = U @ diag(S) @ V^T
+            U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+            self.U.data.copy_(U[:, :self.rank])    # [out_features, rank]
             self.S.data.copy_(S[:self.rank])       # [rank]
-            self.Vh.data.copy_(Vh[:self.rank, :])  # [rank, out_features]
+            self.Vh.data.copy_(Vh[:self.rank, :])  # [rank, in_features]
             if linear_layer.bias is not None and self.bias is not None:
                 self.bias.data.copy_(linear_layer.bias.data)
+            
+            # 验证SVD重构是否正确
+            W_recon = self.U @ torch.diag(self.S) @ self.Vh
+            W_recon = W_recon.to(W.device)  # 确保在同一设备上
+            error = torch.norm(W - W_recon) / torch.norm(W)
+            print(f"SVD reconstruction error: {error:.6f}")
+            if error > 1e-3:
+                print(f"WARNING: Large SVD reconstruction error: {error:.6f}")
         return self
 
     def quantize_parameters(self, num_bits=8):
@@ -425,20 +440,30 @@ class SVDLinear(nn.Module):
         # 调试：打印is_quantized
         if not hasattr(self, 'is_quantized'):
             self.is_quantized = False
-        print('SVDLinear forward, is_quantized:', self.is_quantized)
+        print(f'SVDLinear forward, is_quantized: {self.is_quantized}, input shape: {x.shape}, input range: [{x.min():.3f}, {x.max():.3f}]')
+        
+        # 测试模式：直接使用原始权重（如果存在）
+        if hasattr(self, 'original_weight') and hasattr(self, 'original_bias'):
+            res = x @ self.original_weight.T
+            if self.original_bias is not None:
+                res = res + self.original_bias
+            print(f'Using original weights, output shape: {res.shape}, output range: [{res.min():.3f}, {res.max():.3f}]')
+            return res
+            
         if self.is_quantized:
             U = self.dequantize_tensor(self.q_U, self.scale_U)
             S = self.dequantize_tensor(self.q_S, self.scale_S)
             Vh = self.dequantize_tensor(self.q_Vh, self.scale_Vh)
         else:
             U, S, Vh = self.U, self.S, self.Vh
-        # 正确的SVD重组顺序
-        res = x @ U      # [batch, rank]
-        res = res * S    # [batch, rank]
-        res = res @ Vh   # [batch, out_features]
+        # 正确的SVD重组顺序：y = x @ (U @ diag(S) @ V^T)^T = x @ V @ diag(S) @ U^T
+        res = x @ Vh.T      # [batch, rank]
+        res = res * S       # [batch, rank]
+        res = res @ U.T     # [batch, out_features]
         bias = self.bias if not self.is_quantized else (self.dequantize_tensor(self.q_bias, self.scale_bias) if self.bias is not None else None)
         if bias is not None:
             res = res + bias
+        print(f'output shape: {res.shape}, output range: [{res.min():.3f}, {res.max():.3f}]')
         return res
         
     def __repr__(self):
@@ -451,6 +476,7 @@ def apply_svd_to_dit(model, rank_ratio=0.5):
     Recursively replaces nn.Linear in Attention and MLP blocks of a DiT model
     with SVDLinear layers. This function should be called after loading a pre-trained model.
     """
+    replaced_count = 0
     for block in model.blocks:
         # Replace in Attention block
         attn = block.attn
@@ -458,11 +484,13 @@ def apply_svd_to_dit(model, rank_ratio=0.5):
             qkv = attn.qkv
             svd_qkv = SVDLinear(qkv.in_features, qkv.out_features, qkv.bias is not None, rank_ratio).from_linear(qkv)
             attn.qkv = svd_qkv.to(qkv.weight.device)
+            replaced_count += 1
         
         if isinstance(attn.proj, nn.Linear):
             proj = attn.proj
             svd_proj = SVDLinear(proj.in_features, proj.out_features, proj.bias is not None, rank_ratio).from_linear(proj)
             attn.proj = svd_proj.to(proj.weight.device)
+            replaced_count += 1
 
         # Replace in MLP block
         mlp = block.mlp
@@ -470,11 +498,13 @@ def apply_svd_to_dit(model, rank_ratio=0.5):
             fc1 = mlp.fc1
             svd_fc1 = SVDLinear(fc1.in_features, fc1.out_features, fc1.bias is not None, rank_ratio).from_linear(fc1)
             mlp.fc1 = svd_fc1.to(fc1.weight.device)
+            replaced_count += 1
 
         if isinstance(mlp.fc2, nn.Linear):
             fc2 = mlp.fc2
             svd_fc2 = SVDLinear(fc2.in_features, fc2.out_features, fc2.bias is not None, rank_ratio).from_linear(fc2)
             mlp.fc2 = svd_fc2.to(fc2.weight.device)
+            replaced_count += 1
 
     # Replace in FinalLayer
     if isinstance(model.final_layer.linear, nn.Linear):
@@ -486,8 +516,9 @@ def apply_svd_to_dit(model, rank_ratio=0.5):
             rank_ratio
         ).from_linear(final_linear)
         model.final_layer.linear = svd_final.to(final_linear.weight.device)
+        replaced_count += 1
     
-    print(f"Replaced nn.Linear layers in Transformer blocks with SVDLinear (rank_ratio={rank_ratio}).")
+    print(f"Replaced {replaced_count} nn.Linear layers in Transformer blocks with SVDLinear (rank_ratio={rank_ratio}).")
     return model
 
 

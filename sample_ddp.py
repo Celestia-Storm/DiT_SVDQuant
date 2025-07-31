@@ -169,7 +169,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
     parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="mse")
-    parser.add_argument("--sample-dir", type=str, default="/root/autodl-tmp/imagenet-1k/generated")
+    parser.add_argument("--sample-dir", type=str, default="/root/autodl-tmp/imagenet-1k/generated_1")
     parser.add_argument("--per-proc-batch-size", type=int, default=32)
     parser.add_argument("--num-fid-samples", type=int, default=5000)
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
@@ -181,6 +181,6 @@ if __name__ == "__main__":
                         help="By default, use TF32 matmuls. This massively accelerates sampling on Ampere GPUs.")
     parser.add_argument("--ckpt", type=str, default="DiT-XL-2-256x256.pt",
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
-    parser.add_argument("--rank-ratio", type=float, default=0.95, help="SVD rank ratio for quantized model (default: 0.5)")
+    parser.add_argument("--rank-ratio", type=float, default=1.0, help="SVD rank ratio for quantized model (default: 0.5)")
     args = parser.parse_args()
     main(args)
